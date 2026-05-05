@@ -75,19 +75,43 @@ export default function Home() {
 
   useEffect(() => setMounted(true), []);
 
-  // Load from localStorage
+  // Load from API (database)
   useEffect(() => {
-    const saved = localStorage.getItem("steam-tracker-accounts");
-    if (saved) {
+    const loadAccounts = async () => {
       try {
-        setAccounts(JSON.parse(saved));
+        const res = await fetch("/api/accounts");
+        if (res.ok) {
+          const data = await res.json();
+          // Transform database format to frontend format
+          const formatted = (data.accounts || []).map((acc: any) => ({
+            id: String(acc.id),
+            steamId64: acc.steamId64,
+            profileUrl: acc.profileUrl,
+            personaName: acc.personaName,
+            avatarUrl: acc.avatarUrl,
+            addedAt: acc.addedAt,
+            archived: acc.archived,
+            banStatus: acc.banStatus,
+            lastChecked: acc.lastChecked,
+          }));
+          setAccounts(formatted);
+        }
       } catch {
-        // ignore parse errors
+        // Fallback to localStorage if database not configured
+        const saved = localStorage.getItem("steam-tracker-accounts");
+        if (saved) {
+          try {
+            setAccounts(JSON.parse(saved));
+          } catch {
+            // ignore parse errors
+          }
+        }
       }
-    }
+    };
+    loadAccounts();
   }, []);
 
-  // Save to localStorage
+  // Save to localStorage as backup (only if database fails)
   useEffect(() => {
     if (mounted) {
       localStorage.setItem("steam-tracker-accounts", JSON.stringify(accounts));
@@ -109,6 +133,25 @@ export default function Home() {
       const data = await res.json();
 
       if (res.ok && data.results) {
+        const now = new Date().toISOString();
+        
+        // Update database for changed accounts
+        const updates = activeAccounts.map(async (account) => {
+          const banInfo = data.results[account.steamId64] as BanStatus | undefined;
+          if (banInfo && JSON.stringify(banInfo) !== JSON.stringify(account.banStatus)) {
+            try {
+              await fetch(`/api/accounts/${account.id}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ banStatus: banInfo, lastChecked: now }),
+              });
+            } catch {
+              // Continue even if update fails
+            }
+          }
+        });
+        await Promise.all(updates);
+        
         setAccounts((prev) => {
           const updated = prev.map((account) => {
             const banInfo = data.results[account.steamId64] as BanStatus | undefined;
@@ -116,7 +159,7 @@ export default function Home() {
               return {
                 ...account,
                 banStatus: banInfo,
-                lastChecked: new Date().toISOString(),
+                lastChecked: now,
               };
             }
             return account;
@@ -165,16 +208,36 @@ export default function Home() {
         return;
       }
 
+      // Save to database
+      const saveRes = await fetch("/api/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          steamId64: data.steamId64,
+          personaName: data.personaName,
+          avatarUrl: data.avatarUrl,
+          profileUrl: data.profileUrl,
+          banStatus: data.banStatus,
+        }),
+      });
+
+      if (!saveRes.ok) {
+        const saveError = await saveRes.json();
+        setError(saveError.error || "Ошибка при сохранении");
+        return;
+      }
+
+      const saveData = await saveRes.json();
       const newAccount: SteamAccount = {
-        id: crypto.randomUUID(),
-        steamId64: data.steamId64,
-        profileUrl: data.profileUrl,
-        personaName: data.personaName,
-        avatarUrl: data.avatarUrl,
-        addedAt: new Date().toISOString(),
-        archived: false,
-        banStatus: data.banStatus,
-        lastChecked: new Date().toISOString(),
+        id: String(saveData.account.id),
+        steamId64: saveData.account.steamId64,
+        profileUrl: saveData.account.profileUrl,
+        personaName: saveData.account.personaName,
+        avatarUrl: saveData.account.avatarUrl,
+        addedAt: saveData.account.addedAt,
+        archived: saveData.account.archived,
+        banStatus: saveData.account.banStatus,
+        lastChecked: saveData.account.lastChecked,
       };
 
       setAccounts((prev) => [newAccount, ...prev]);
@@ -223,19 +286,44 @@ export default function Home() {
     };
   }, [mounted, checkAllBansSilent]);
 
-  const archiveAccount = (id: string) => {
+  const archiveAccount = async (id: string) => {
+    try {
+      await fetch(`/api/accounts/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived: true }),
+      });
+    } catch {
+      // Continue with local update even if API fails
+    }
     setAccounts((prev) =>
       prev.map((a) => (a.id === id ? { ...a, archived: true } : a))
     );
   };
 
-  const restoreAccount = (id: string) => {
+  const restoreAccount = async (id: string) => {
+    try {
+      await fetch(`/api/accounts/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived: false }),
+      });
+    } catch {
+      // Continue with local update even if API fails
+    }
     setAccounts((prev) =>
       prev.map((a) => (a.id === id ? { ...a, archived: false } : a))
     );
   };
 
-  const deleteAccount = (id: string) => {
+  const deleteAccountHandler = async (id: string) => {
+    try {
+      await fetch(`/api/accounts/${id}`, {
+        method: "DELETE",
+      });
+    } catch {
+      // Continue with local delete even if API fails
+    }
     setAccounts((prev) => prev.filter((a) => a.id !== id));
   };
 
@@ -492,7 +580,7 @@ export default function Home() {
                       key={account.id}
                       account={account}
                       onRestore={() => restoreAccount(account.id)}
-                      onDelete={() => deleteAccount(account.id)}
+                      onDelete={() => deleteAccountHandler(account.id)}
                       isArchived
                     />
                   ))}
